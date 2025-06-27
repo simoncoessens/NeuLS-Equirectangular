@@ -4,6 +4,7 @@ import numpy as np
 import os
 import re
 import pickle
+from PIL import Image
 
 import tinycudann as tcnn
 
@@ -26,58 +27,14 @@ class BundleDataset(Dataset):
     def __init__(self, args, load_volume=False):
         self.args = args
         print("Loading from:", self.args.data_path)
-        
-        data = np.load(args.data_path, allow_pickle=True)
-        
-        self.characteristics = data['characteristics'].item() # camera characteristics
-        self.motion = data['motion'].item()
-        self.frame_timestamps = torch.tensor([data[f'raw_{i}'].item()['timestamp'] for i in range(data['num_raw_frames'])], dtype=torch.float64)
-        self.motion_timestamps = torch.tensor(self.motion['timestamp'], dtype=torch.float64)
-        self.num_frames = data['num_raw_frames'].item()
 
-        # WXYZ quaternions, remove phase wraps (2pi jumps)
-        self.quaternions = utils.unwrap_quaternions(torch.tensor(self.motion['quaternion']).float()) # T',4, has different timestamps from frames
-        # flip x/y to match out convention:
-        # +y towards selfie camera, +x towards buttons, +z towards scene
-        self.quaternions[:,1] *= -1
-        self.quaternions[:,2] *= -1
-
-        self.quaternions = utils.multi_interp(self.frame_timestamps, self.motion_timestamps, self.quaternions) # interpolate to frame times
-
-        self.reference_quaternion = self.quaternions[0:1]
-        self.quaternion_camera_to_world = utils.quaternion_multiply(utils.quaternion_conjugate(self.reference_quaternion), self.quaternions)
-        
-        self.intrinsics = torch.tensor(np.array([data[f'raw_{i}'].item()['intrinsics'] for i in range(data['num_raw_frames'])])).float()  # T,3,3  
-        # swap cx,cy -> landscape to portrait
-        cx, cy = self.intrinsics[:, 2, 1].clone(), self.intrinsics[:, 2, 0].clone()
-        self.intrinsics[:, 2, 0], self.intrinsics[:, 2, 1] = cx, cy
-        # transpose to put cx,cy in right column
-        self.intrinsics = self.intrinsics.transpose(1, 2)
-        self.intrinsics_inv = torch.inverse(self.intrinsics)
-
-        self.lens_distortion = torch.tensor(data['raw_0'].item()['lens_distortion'])
-        self.tonemap_curve = torch.tensor(data['raw_0'].item()['tonemap_curve'], dtype=torch.float32)
-        self.ccm = torch.tensor(data['raw_0'].item()['ccm'], dtype=torch.float32)
-
-        self.img_channels = 3
-        self.img_height = data['raw_0'].item()['width'] # rotated 90
-        self.img_width = data['raw_0'].item()['height']
-        self.rgb_volume = None # placeholder volume for fast loading
-
-        # rolling shutter timing compensation, off by default (can bug for data not from a Pixel 8 Pro)
-        self.rolling_shutter_skew = data['raw_0'].item()['android']['sensor.rollingShutterSkew'] / 1e9 # delay between top and bottom row readout, seconds
-        self.rolling_shutter_skew_row = self.rolling_shutter_skew / (self.img_height - 1)
-        self.row_timestamps = torch.zeros(len(self.frame_timestamps), self.img_height, dtype=torch.float64) # NxH
-        for i, frame_timestamp in enumerate(self.frame_timestamps):
-            for j in range(self.img_height):
-                if args.rolling_shutter:
-                    self.row_timestamps[i,j] = frame_timestamp + j * self.rolling_shutter_skew_row
-                else:
-                    self.row_timestamps[i,j] = frame_timestamp
-                    
-
-        self.row_timestamps = self.row_timestamps - self.row_timestamps[0,0] # zero at start
-        self.row_timestamps = self.row_timestamps/self.row_timestamps[-1,-1] # normalize to 0-1
+        if str(self.args.data_path).endswith('.npz'):
+            self.dataset_type = 'frame_bundle'
+            data = np.load(self.args.data_path, allow_pickle=True)
+            self._load_frame_bundle(data)
+        else:
+            self.dataset_type = 'nerfstudio'
+            self._load_nerfstudio(self.args.data_path)
 
         if args.frames is not None:
             # subsample frames
@@ -92,25 +49,144 @@ class BundleDataset(Dataset):
         if load_volume:
             self.load_volume()
 
-        self.frame_batch_size = 2 * (self.args.point_batch_size // self.num_frames // 2) # nearest even cut
-        self.point_batch_size = self.frame_batch_size * self.num_frames # nearest multiple of num_frames
+        self.frame_batch_size = 2 * (self.args.point_batch_size // self.num_frames // 2)
+        self.point_batch_size = self.frame_batch_size * self.num_frames
         self.num_batches = self.args.num_batches
 
-        self.training_phase = 0.0 # fraction of training complete
+        self.training_phase = 0.0
         print("Frame Count: ", self.num_frames)
-    
-    def load_volume(self):
-        volume_path = self.args.data_path.replace("frame_bundle.npz", "rgb_volume.npy") 
-        if os.path.exists(volume_path):
-            print("Loading cached volume from:", volume_path)
-            self.rgb_volume = torch.tensor(np.load(volume_path)).float()
+
+    def _load_frame_bundle(self, data):
+        self.characteristics = data['characteristics'].item()  # camera characteristics
+        self.motion = data['motion'].item()
+        self.frame_timestamps = torch.tensor([data[f'raw_{i}'].item()['timestamp'] for i in range(data['num_raw_frames'])], dtype=torch.float64)
+        self.motion_timestamps = torch.tensor(self.motion['timestamp'], dtype=torch.float64)
+        self.num_frames = data['num_raw_frames'].item()
+
+        self.quaternions = utils.unwrap_quaternions(torch.tensor(self.motion['quaternion']).float())
+        self.quaternions[:, 1] *= -1
+        self.quaternions[:, 2] *= -1
+        self.quaternions = utils.multi_interp(self.frame_timestamps, self.motion_timestamps, self.quaternions)
+
+        self.reference_quaternion = self.quaternions[0:1]
+        self.quaternion_camera_to_world = utils.quaternion_multiply(utils.quaternion_conjugate(self.reference_quaternion), self.quaternions)
+
+        self.intrinsics = torch.tensor(np.array([data[f'raw_{i}'].item()['intrinsics'] for i in range(data['num_raw_frames'])])).float()
+        cx, cy = self.intrinsics[:, 2, 1].clone(), self.intrinsics[:, 2, 0].clone()
+        self.intrinsics[:, 2, 0], self.intrinsics[:, 2, 1] = cx, cy
+        self.intrinsics = self.intrinsics.transpose(1, 2)
+        self.intrinsics_inv = torch.inverse(self.intrinsics)
+
+        self.lens_distortion = torch.tensor(data['raw_0'].item()['lens_distortion'])
+        self.tonemap_curve = torch.tensor(data['raw_0'].item()['tonemap_curve'], dtype=torch.float32)
+        self.ccm = torch.tensor(data['raw_0'].item()['ccm'], dtype=torch.float32)
+
+        self.img_channels = 3
+        self.img_height = data['raw_0'].item()['width']
+        self.img_width = data['raw_0'].item()['height']
+        self.rgb_volume = None
+
+        self.rolling_shutter_skew = data['raw_0'].item()['android']['sensor.rollingShutterSkew'] / 1e9
+        self.rolling_shutter_skew_row = self.rolling_shutter_skew / (self.img_height - 1)
+        self.row_timestamps = torch.zeros(len(self.frame_timestamps), self.img_height, dtype=torch.float64)
+        for i, frame_timestamp in enumerate(self.frame_timestamps):
+            for j in range(self.img_height):
+                if self.args.rolling_shutter:
+                    self.row_timestamps[i, j] = frame_timestamp + j * self.rolling_shutter_skew_row
+                else:
+                    self.row_timestamps[i, j] = frame_timestamp
+
+        self.row_timestamps = self.row_timestamps - self.row_timestamps[0, 0]
+        self.row_timestamps = self.row_timestamps / self.row_timestamps[-1, -1]
+
+    def _load_nerfstudio(self, path):
+        if os.path.isdir(path):
+            json_path = os.path.join(path, 'transforms.json')
         else:
-            data = dict(np.load(self.args.data_path, allow_pickle=True))
-            utils.de_item(data)
-            self.rgb_volume = (utils.raw_to_rgb(data)) # T,C,H,W
-            if self.args.cache:
-                print("Saving cached volume to:", volume_path)
-                np.save(volume_path, self.rgb_volume.numpy())
+            json_path = path
+
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+
+        if isinstance(meta, dict) and 'frames' in meta:
+            frames = meta['frames']
+        else:
+            frames = meta
+
+        self.num_frames = len(frames)
+        intrinsics = []
+        quats = []
+        rgb_paths = []
+        translations = []
+        for fr in frames:
+            w = fr['w']
+            h = fr['h']
+            fx = fr.get('fl_x', fr.get('fl_y', 1.0))
+            fy = fr.get('fl_y', fx)
+            cx = fr.get('cx', 0.5)
+            cy = fr.get('cy', 0.5)
+            if fx < 10:
+                fx *= w
+            if fy < 10:
+                fy *= h
+            if cx <= 1:
+                cx *= w
+            if cy <= 1:
+                cy *= h
+            intrinsics.append(torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32))
+
+            mat = np.array(fr['transform_matrix'])
+            if mat.shape == (3, 4):
+                mat = np.vstack([mat, [0, 0, 0, 1]])
+            R = mat[:3, :3]
+            quats.append(utils.convert_rot_to_quaternions(torch.tensor(R)[None]).squeeze(0))
+
+            translations.append(torch.tensor(mat[:3, 3], dtype=torch.float32))
+
+            rgb_paths.append(os.path.join(os.path.dirname(json_path), fr['file_path']))
+
+        self.rgb_paths = rgb_paths
+        self.translations_world = torch.stack(translations)
+        self.translation_center = self.translations_world.mean(dim=0, keepdim=True)
+        self.translation_offsets = self.translations_world - self.translation_center
+        self.intrinsics = torch.stack(intrinsics)
+        self.intrinsics_inv = torch.inverse(self.intrinsics)
+        self.quaternions = utils.unwrap_quaternions(torch.stack(quats))
+        self.reference_quaternion = self.quaternions[0:1]
+        self.quaternion_camera_to_world = utils.quaternion_multiply(utils.quaternion_conjugate(self.reference_quaternion), self.quaternions)
+
+        self.frame_timestamps = torch.linspace(0, 1, self.num_frames, dtype=torch.float64)
+        self.row_timestamps = self.frame_timestamps[:, None].repeat(1, int(h))
+
+        self.lens_distortion = torch.zeros(5)
+        self.tonemap_curve = torch.tensor([[[0.0, 0.0], [1.0, 1.0]]] * 3, dtype=torch.float32)
+        self.ccm = torch.eye(3)
+
+        self.img_channels = 3
+        self.img_height = int(h)
+        self.img_width = int(w)
+        self.rgb_volume = None
+
+    def load_volume(self):
+        if self.dataset_type == 'frame_bundle':
+            volume_path = self.args.data_path.replace("frame_bundle.npz", "rgb_volume.npy")
+            if os.path.exists(volume_path):
+                print("Loading cached volume from:", volume_path)
+                self.rgb_volume = torch.tensor(np.load(volume_path)).float()
+            else:
+                data = dict(np.load(self.args.data_path, allow_pickle=True))
+                utils.de_item(data)
+                self.rgb_volume = (utils.raw_to_rgb(data))
+                if self.args.cache:
+                    print("Saving cached volume to:", volume_path)
+                    np.save(volume_path, self.rgb_volume.numpy())
+        else:
+            images = []
+            for p in self.rgb_paths:
+                img = Image.open(p).convert('RGB')
+                img = torch.from_numpy(np.array(img)).float() / 255.0
+                images.append(img.permute(2, 0, 1))
+            self.rgb_volume = torch.stack(images, dim=0)
 
         if self.args.max_percentile < 100: # cut off highlights (long-tail-distribution)
             self.clip = np.percentile(self.rgb_volume[0], self.args.max_percentile)
@@ -393,6 +469,10 @@ class PanoModel(pl.LightningModule):
         self.model_rotation = RotationModel(self.args)
         self.model_distortion = DistortionModel(self.args)
         self.model_light_sphere = LightSphereModel(self.args)
+
+        if hasattr(self.data, 'translation_center'):
+            with torch.no_grad():
+                self.model_translation.center.data = self.data.translation_center
 
         self.training_phase = 1.0
         self.save_hyperparameters()
@@ -683,7 +763,8 @@ if __name__ == "__main__":
     parser.add_argument('--network_color_angle_config', type=str, default="large", help="Network color angle configuration (tiny, small, medium, large, ultrakill).")
 
     # training
-    parser.add_argument('--data_path', '--d', type=str, required=True, help="Path to frame_bundle.npz")
+    parser.add_argument('--data_path', '--d', type=str, required=True,
+                        help="Path to frame_bundle.npz or nerfstudio dataset directory")
     parser.add_argument('--name', type=str, required=True, help="Experiment name for logs and checkpoints.")
     parser.add_argument('--max_epochs', type=int, default=100, help="Number of training epochs.")
     parser.add_argument('--lr', type=float, default=5e-4, help="Learning rate.")
