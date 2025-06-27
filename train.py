@@ -117,6 +117,8 @@ class BundleDataset(Dataset):
         intrinsics = []
         quats = []
         rgb_paths = []
+        translations = []
+        
         for fr in frames:
             w = fr['w']
             h = fr['h']
@@ -140,9 +142,15 @@ class BundleDataset(Dataset):
             R = mat[:3, :3]
             quats.append(utils.convert_rot_to_quaternions(torch.tensor(R)[None]).squeeze(0))
 
+            translations.append(torch.tensor(mat[:3, 3], dtype=torch.float32))
+
             rgb_paths.append(os.path.join(os.path.dirname(json_path), fr['file_path']))
 
         self.rgb_paths = rgb_paths
+        self.translations_world = torch.stack(translations)
+        self.translation_center = self.translations_world.mean(dim=0, keepdim=True)
+        self.translation_offsets = self.translations_world - self.translation_center
+
         self.intrinsics = torch.stack(intrinsics)
         self.intrinsics_inv = torch.inverse(self.intrinsics)
         self.quaternions = utils.unwrap_quaternions(torch.stack(quats))
@@ -463,6 +471,10 @@ class PanoModel(pl.LightningModule):
         self.model_rotation = RotationModel(self.args)
         self.model_distortion = DistortionModel(self.args)
         self.model_light_sphere = LightSphereModel(self.args)
+
+        if hasattr(self.data, 'translation_center'):
+            with torch.no_grad():
+                self.model_translation.center.data = self.data.translation_center
 
         self.training_phase = 1.0
         self.save_hyperparameters()
