@@ -118,6 +118,7 @@ class BundleDataset(Dataset):
         quats = []
         rgb_paths = []
         translations = []
+        
         for fr in frames:
             w = fr['w']
             h = fr['h']
@@ -149,6 +150,7 @@ class BundleDataset(Dataset):
         self.translations_world = torch.stack(translations)
         self.translation_center = self.translations_world.mean(dim=0, keepdim=True)
         self.translation_offsets = self.translations_world - self.translation_center
+
         self.intrinsics = torch.stack(intrinsics)
         self.intrinsics_inv = torch.inverse(self.intrinsics)
         self.quaternions = utils.unwrap_quaternions(torch.stack(quats))
