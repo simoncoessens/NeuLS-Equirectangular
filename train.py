@@ -756,7 +756,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', '--d', type=str, required=True,
                         help="Path to frame_bundle.npz or nerfstudio dataset directory")
     parser.add_argument('--name', type=str, required=True, help="Experiment name for logs and checkpoints.")
-    parser.add_argument('--max_epochs', type=int, default=100, help="Number of training epochs.")
+    parser.add_argument('--max_epochs', type=int, default=5, help="Number of training epochs.")
     parser.add_argument('--lr', type=float, default=5e-4, help="Learning rate.")
     parser.add_argument('--weight_decay', type=float, default=1e-5, help="Weight decay.")
     parser.add_argument('--save_video', action='store_true', help="Store training outputs at each epoch for visualization.")
