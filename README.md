@@ -54,6 +54,10 @@ TLDR: models can be trained with:
 
 `python3 train.py --data_path {path_to_data} --name {checkpoint_name}`
 
+The `{path_to_data}` argument may point to either a `frame_bundle.npz` file or
+a directory containing a `transforms.json` file in the Nerfstudio dataset
+format.
+
 For a full list of training arguments, we recommend looking through the argument parser section at the bottom of `\train.py`.
 
 The final model checkpoint will be saved to `checkpoints/{checkpoint_name}/last.ckpt`
