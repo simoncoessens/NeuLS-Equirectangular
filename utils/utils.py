@@ -132,6 +132,45 @@ def convert_quaternions_to_rot(quaternions):
     R = torch.stack([r00, r01, r02, r10, r11, r12, r20, r21, r22], dim=-1)
     return R.reshape(-1, 3, 3)
 
+def convert_rot_to_quaternions(rot):
+    """Convert rotation matrices to quaternions (WXYZ)."""
+    if isinstance(rot, torch.Tensor):
+        R = rot.cpu().numpy()
+    else:
+        R = np.asarray(rot)
+
+    quats = []
+    for i in range(R.shape[0]):
+        m = R[i]
+        trace = m[0, 0] + m[1, 1] + m[2, 2]
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (m[2, 1] - m[1, 2]) / s
+            qy = (m[0, 2] - m[2, 0]) / s
+            qz = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            qw = (m[2, 1] - m[1, 2]) / s
+            qx = 0.25 * s
+            qy = (m[0, 1] + m[1, 0]) / s
+            qz = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            qw = (m[0, 2] - m[2, 0]) / s
+            qx = (m[0, 1] + m[1, 0]) / s
+            qy = 0.25 * s
+            qz = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            qw = (m[1, 0] - m[0, 1]) / s
+            qx = (m[0, 2] + m[2, 0]) / s
+            qy = (m[1, 2] + m[2, 1]) / s
+            qz = 0.25 * s
+        quats.append([qw, qx, qy, qz])
+
+    return torch.tensor(quats, dtype=torch.float32)
+
 @torch.no_grad()
 def raw_to_rgb(bundle):
     """
