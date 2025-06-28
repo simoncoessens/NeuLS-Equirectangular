@@ -4,6 +4,7 @@ import numpy as np
 import os
 import re
 import pickle
+from pathlib import Path
 from PIL import Image
 
 import tinycudann as tcnn
@@ -732,6 +733,34 @@ class ValidationCallback(pl.Callback):
             model.data.rgb_volume = None
             pickle.dump(model.data, file)
 
+
+class DebugCallback(pl.Callback):
+    """Simple debugging utilities printed during training."""
+
+    def __init__(self):
+        super().__init__()
+        self.test_t = torch.tensor([[0.0]], dtype=torch.float32)
+        self.test_uv = torch.tensor([[0.5, 0.5]], dtype=torch.float32)
+        self.test_origin = torch.zeros(1, 3, dtype=torch.float32)
+        self.test_dir = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        t = self.test_t.to(pl_module.device)
+        uv = self.test_uv.to(pl_module.device)
+        origin = self.test_origin.to(pl_module.device)
+        direction = self.test_dir.to(pl_module.device)
+        rgb = pl_module.inference(t, uv, origin, direction, training_phase=pl_module.training_phase)
+        rgb_str = ', '.join(f"{v:.4f}" for v in rgb.squeeze().tolist())
+        print(f"[Debug] Epoch {pl_module.current_epoch}: sample RGB [{rgb_str}]")
+
+    def on_train_end(self, trainer, pl_module):
+        rgb_reference, rgb, _, _ = pl_module.generate_outputs(time=0.0, height=64, width=64)
+        out_path = Path("outputs") / pl_module.args.name / "debug_render.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img_np = (rgb.permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype(np.uint8)
+        Image.fromarray(img_np).save(out_path)
+        print(f"[Debug] Saved debug render to {out_path}")
+
 if __name__ == "__main__":
     
     # argparse
@@ -803,6 +832,16 @@ if __name__ == "__main__":
     lr_callback = pl.callbacks.LearningRateMonitor()
     logger = pl.loggers.TensorBoardLogger(save_dir=os.getcwd(), version=args.name, name="lightning_logs")
     validation_callback = ValidationCallback()
-    trainer = pl.Trainer(accelerator="gpu", devices=torch.cuda.device_count(), num_nodes=1, strategy="auto", max_epochs=args.max_epochs,
-                         logger=logger, callbacks=[validation_callback, lr_callback], enable_checkpointing=False, fast_dev_run=args.debug)
+    debug_callback = DebugCallback()
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=torch.cuda.device_count(),
+        num_nodes=1,
+        strategy="auto",
+        max_epochs=args.max_epochs,
+        logger=logger,
+        callbacks=[validation_callback, debug_callback, lr_callback],
+        enable_checkpointing=False,
+        fast_dev_run=args.debug,
+    )
     trainer.fit(model, train_loader)
