@@ -722,6 +722,8 @@ class ValidationCallback(pl.Callback):
         
         os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
         checkpoint = trainer._checkpoint_connector.dump_checkpoint()
+
+        print("saved checkpoint")
         
         # Forcibly remove optimizer states from the checkpoint
         if 'optimizer_states' in checkpoint:
